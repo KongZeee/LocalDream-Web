@@ -1,0 +1,47 @@
+# Dependencies
+**/node_modules/
+**/__pycache__/
+**/*.pyc
+**/*.pyo
+**/*.pyd
+**/.venv/
+**/venv/
+**/env/
+
+# Build outputs
+**/dist/
+**/build/
+**/.next/
+**/.vite/
+
+# Backend runtime data (models, outputs, DB, logs)
+web/backend/data/
+web/backend/outputs/
+web/backend/logs/
+web/backend/*.log
+web/backend/*.txt
+web/backend/test_output.png
+web/backend/test_res_*.jpg
+web/backend/test_sd15.jpg
+
+# Local configs
+**/.env
+**/.env.local
+**/.env.*.local
+
+# IDE / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+*.swp
+
+# Python tooling
+.mypy_cache/
+.pytest_cache/
+.ruff_cache/
+
+# Misc
+*.bak
+*.tmp
+.cursor_temp/
