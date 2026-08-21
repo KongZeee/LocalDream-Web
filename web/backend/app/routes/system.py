@@ -98,27 +98,29 @@ def _get_cpu_memory():
         return None, None
 
 
+def get_gpu_info() -> tuple[bool, str]:
+    """Detect the GPU backend: CUDA device name, DirectML device, or CPU."""
+    try:
+        import torch
+        if torch.cuda.is_available():
+            return True, torch.cuda.get_device_name(0)
+    except Exception:
+        pass
+    try:
+        import torch_directml
+        try:
+            return True, f"{torch_directml.device_name(0)} (DirectML)"
+        except Exception:
+            return True, "AMD GPU (DirectML)"
+    except ImportError:
+        return False, "CPU"
+
+
 @router.get("/status", response_model=SystemStatus)
 async def get_status():
     from app.services.generator import get_loaded_model, get_loaded_models
 
-    gpu_name = "CPU"
-    gpu_available = False
-    try:
-        import torch
-        if torch.cuda.is_available():
-            gpu_name = torch.cuda.get_device_name(0)
-            gpu_available = True
-        else:
-            try:
-                import torch_directml
-                gpu_name = "AMD GPU (DirectML)"
-                gpu_available = True
-            except ImportError:
-                gpu_name = "CPU"
-                gpu_available = False
-    except Exception:
-        pass
+    gpu_available, gpu_name = get_gpu_info()
 
     gpu_used, gpu_total = _get_gpu_memory()
     cpu_used, cpu_total = _get_cpu_memory()

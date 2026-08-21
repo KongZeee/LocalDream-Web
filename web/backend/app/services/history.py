@@ -26,37 +26,43 @@ async def add_history(
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
     db = await get_db()
-    print(f"[History] DB connected")
     try:
+        # Insert first and use the AUTOINCREMENT id as the file name.
+        # (The previous COUNT(*)+1 scheme re-used ids after deletions and
+        # silently overwrote older image files.)
         cursor = await db.execute(
-            "SELECT COUNT(*) as c FROM history_items"
-        )
-        row = await cursor.fetchone()
-        count = row["c"]
-        image_id = count + 1
-
-        image_path = str(Path(OUTPUT_DIR) / f"{image_id}.{image_format}")
-        image_data = base64.b64decode(image_b64)
-        with open(image_path, "wb") as f:
-            f.write(image_data)
-
-        from PIL import Image
-        thumb_path = str(Path(OUTPUT_DIR) / f"{image_id}_thumb.jpg")
-        img = Image.open(io.BytesIO(image_data))
-        img.thumbnail((256, 256))
-        img.save(thumb_path, "JPEG", quality=80)
-
-        print(f"[History] Inserting: prompt={prompt[:50]}, path={image_path}")
-        await db.execute(
             """INSERT INTO history_items
                (prompt, negative_prompt, seed, steps, cfg, width, height,
                 model_id, scheduler, mode, image_path, thumbnail_path)
-               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+               VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, '', '')""",
             (prompt, negative_prompt, seed, steps, cfg, width, height,
-             model_id, scheduler, mode, image_path, thumb_path),
+             model_id, scheduler, mode),
+        )
+        image_id = cursor.lastrowid
+        await db.commit()
+
+        try:
+            image_path = str(Path(OUTPUT_DIR) / f"{image_id}.{image_format}")
+            image_data = base64.b64decode(image_b64)
+            with open(image_path, "wb") as f:
+                f.write(image_data)
+
+            from PIL import Image
+            thumb_path = str(Path(OUTPUT_DIR) / f"{image_id}_thumb.jpg")
+            img = Image.open(io.BytesIO(image_data))
+            img.thumbnail((256, 256))
+            img.save(thumb_path, "JPEG", quality=80)
+        except Exception:
+            # Roll the empty row back so history stays consistent with disk.
+            await db.execute("DELETE FROM history_items WHERE id=?", (image_id,))
+            await db.commit()
+            raise
+
+        await db.execute(
+            "UPDATE history_items SET image_path=?, thumbnail_path=? WHERE id=?",
+            (image_path, thumb_path, image_id),
         )
         await db.commit()
-        print(f"[History] Insert committed, id={image_id}")
         return image_id
     finally:
         await db.close()

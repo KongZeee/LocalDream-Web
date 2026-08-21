@@ -83,6 +83,7 @@ export function generateImage(
   onProgress: (event: SSEProgressEvent) => void,
   onComplete: (event: SSECompleteEvent) => void,
   onError: (error: string) => void,
+  onNotice?: (message: string) => void,
 ): AbortController {
   const controller = new AbortController();
   const baseUrl = getBaseUrl();
@@ -127,6 +128,7 @@ export function generateImage(
             else if (data.type === 'progress') onProgress(data as SSEProgressEvent);
             else if (data.type === 'complete') onComplete(data as SSECompleteEvent);
             else if (data.type === 'error') onError(data.message);
+            else if (data.type === 'notice') onNotice?.(data.message);
           } catch {
             // skip unparseable lines
           }

@@ -55,6 +55,10 @@ async def generate(req: GenerateRequest):
                 loras=req.loras,
             ):
                 if event["type"] == "complete":
+                    # Send the result to the client FIRST — history persistence
+                    # (base64 decode + thumbnail + disk write) must not delay
+                    # the image the user is waiting for.
+                    yield f"data: {json.dumps(event)}\n\n"
                     try:
                         await add_history(
                             prompt=req.prompt,
@@ -62,8 +66,8 @@ async def generate(req: GenerateRequest):
                             seed=event["seed"],
                             steps=req.steps,
                             cfg=req.cfg,
-                            width=req.width,
-                            height=req.height,
+                            width=event.get("width", req.width),
+                            height=event.get("height", req.height),
                             model_id=req.model_id,
                             scheduler=req.scheduler,
                             mode=req.mode,
@@ -74,6 +78,7 @@ async def generate(req: GenerateRequest):
                         import traceback
                         print(f"[History] add_history failed: {type(e).__name__}: {e}")
                         traceback.print_exc()
+                    continue
 
                 yield f"data: {json.dumps(event)}\n\n"
 
@@ -94,10 +99,12 @@ async def generate(req: GenerateRequest):
 @router.get("/health")
 async def health():
     from app.config import MODELS_DIR
+    from app.routes.system import get_gpu_info
+    gpu_available, gpu_name = get_gpu_info()
     return {
         "status": "ok",
-        "gpu_available": True,
-        "gpu_name": "AMD GPU (DirectML)",
+        "gpu_available": gpu_available,
+        "gpu_name": gpu_name,
         "loaded_model": get_loaded_model(),
         "models_dir": MODELS_DIR,
     }

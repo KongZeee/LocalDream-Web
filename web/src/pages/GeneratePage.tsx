@@ -121,6 +121,10 @@ export default function GeneratePage() {
   const [finalFormat, setFinalFormat] = useState('jpeg');
   const [generationTime, setGenerationTime] = useState(0);
   const [error, setError] = useState<string | null>(null);
+  const [notice, setNotice] = useState<string | null>(null);
+  // Actual output size — the backend may downgrade resolution on OOM.
+  const [resultWidth, setResultWidth] = useState(width);
+  const [resultHeight, setResultHeight] = useState(height);
 
   const abortRef = useRef<AbortController | null>(null);
 
@@ -182,6 +186,7 @@ export default function GeneratePage() {
   const handleGenerate = async () => {
     if (!prompt.trim() || !modelId) return;
     setError(null);
+    setNotice(null);
     setFinalImage(null);
     setIntermediateImage(null);
     setGenerating(true);
@@ -235,6 +240,8 @@ export default function GeneratePage() {
         setFinalImage(`data:image/${event.format};base64,${event.image}`);
         setFinalFormat(event.format);
         setGenerationTime(event.generation_time_ms);
+        setResultWidth(event.width);
+        setResultHeight(event.height);
         setGenerating(false);
         setCurrentStep(event.total_steps);
         if (actualSeed !== seed) setSeed(actualSeed);
@@ -242,6 +249,9 @@ export default function GeneratePage() {
       (errMsg: string) => {
         setError(errMsg);
         setGenerating(false);
+      },
+      (msg: string) => {
+        setNotice(msg);
       },
     );
   };
@@ -642,6 +652,12 @@ export default function GeneratePage() {
         </div>
         </div>
 
+        {notice && (
+          <div className="p-3 bg-yellow-500/10 border border-yellow-500/30 rounded-lg animate-slide-up">
+            <p className="text-xs text-yellow-400">{notice}</p>
+          </div>
+        )}
+
         {error && (
           <div className="p-3 bg-red-500/10 border border-red-500/30 rounded-lg">
             <p className="text-xs text-red-400">{error}</p>
@@ -689,7 +705,7 @@ export default function GeneratePage() {
         {finalImage && (
           <div className="flex items-center gap-3 mt-3 p-3 bg-surface-light border border-surface-border rounded-lg animate-slide-up">
             <div className="flex items-center gap-2 text-xs text-gray-400">
-              <span>{width}x{height}</span>
+              <span>{resultWidth}x{resultHeight}</span>
               <span>·</span>
               <span>{(generationTime / 1000).toFixed(1)}秒</span>
               <span>·</span>

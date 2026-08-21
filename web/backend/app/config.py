@@ -11,6 +11,9 @@ DB_PATH = os.environ.get("LOCAL_DREAM_DB_PATH", str(Path(DATA_DIR) / "localdream
 HOST = os.environ.get("LOCAL_DREAM_HOST", "0.0.0.0")
 PORT = int(os.environ.get("LOCAL_DREAM_PORT", "8081"))
 
+# Maximum number of Diffusers pipelines kept in VRAM (LRU). Raise on 16GB+ cards.
+MAX_CACHED_PIPELINES = int(os.environ.get("LOCAL_DREAM_MAX_PIPELINES", "2"))
+
 DEFAULT_STEPS = 15
 DEFAULT_CFG = 7.0
 DEFAULT_WIDTH = 512

@@ -18,18 +18,27 @@ export default function ModelListPage() {
     loadModels();
   }, []);
 
-  async function loadModels() {
+  // The backend downloads in the background — poll while anything is
+  // still in "downloading" state.
+  useEffect(() => {
+    const hasDownloading = models.some((m) => m.status === 'downloading');
+    if (!hasDownloading) return;
+    const t = setInterval(() => loadModels(true), 5000);
+    return () => clearInterval(t);
+  }, [models]);
+
+  async function loadModels(silent = false) {
     try {
-      setLoading(true);
+      if (!silent) setLoading(true);
       const data = await fetchModels();
       if (data?.models) {
         setModels(data.models as ModelInfo[]);
         if (data.default_model) setSelectedModelId(data.default_model);
       }
     } catch {
-      setModels([]);
+      if (!silent) setModels([]);
     } finally {
-      setLoading(false);
+      if (!silent) setLoading(false);
     }
   }
 
@@ -37,6 +46,8 @@ export default function ModelListPage() {
     if (!downloadId.trim()) return;
     setDownloading(true);
     try {
+      // Returns immediately — actual download runs in the background and
+      // the list polls for status updates.
       await downloadModel(downloadId.trim(), downloadType);
       setShowDownload(false);
       setDownloadId('');

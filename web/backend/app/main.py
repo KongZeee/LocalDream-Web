@@ -1,6 +1,3 @@
-import sys
-sys.path.insert(0, r"C:\py_pkgs")
-
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware

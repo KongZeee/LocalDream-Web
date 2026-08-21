@@ -45,8 +45,9 @@ from diffusers import (
     LCMScheduler,
 )
 
-from app.config import MODELS_DIR, OUTPUT_DIR
+from app.config import MODELS_DIR, OUTPUT_DIR, MAX_CACHED_PIPELINES
 from app.services.lora_manager import apply_loras, clear_all_loras, mark_pipeline, scan_loras
+from app.services.model_manager import detect_sdxl
 
 _EMBEDDING_PATCH_LOCK = threading.Lock()
 _EMBEDDING_PATCH_DONE = False
@@ -54,6 +55,11 @@ _ORIG_EMBEDDING = F.embedding
 
 # CPU VAE for SDXL (loaded on demand, fp32)
 _cpu_vae_cache = None
+
+# CPU fp32 VAE copies for SD 1.5 preview decoding, keyed by model_id.
+# Decoding previews with a cached CPU copy avoids moving the live VAE
+# DML→CPU→DML on every preview step (hundreds of ms each time).
+_cpu_vae_cache_sd15: dict = {}
 
 
 def _get_cpu_vae_fp32():
@@ -68,6 +74,21 @@ def _get_cpu_vae_fp32():
         _cpu_vae_cache.to("cpu").float()
         print("[Generator] Loaded fp16-fix VAE (fp32) on CPU for SDXL decode")
     return _cpu_vae_cache
+
+
+def _get_sd15_cpu_vae(pipe, model_id: str):
+    """Return a cached CPU fp32 copy of the SD 1.5 VAE for preview decoding.
+
+    The previous implementation moved the live VAE DML→CPU→DML around every
+    preview decode; a one-time cached copy removes that round trip entirely.
+    """
+    vae = _cpu_vae_cache_sd15.get(model_id)
+    if vae is None:
+        import copy
+        vae = copy.deepcopy(pipe.vae).to("cpu").float()
+        _cpu_vae_cache_sd15[model_id] = vae
+        print(f"[Generator] Cached CPU fp32 VAE copy of {model_id} for previews")
+    return vae
 
 
 def _patch_nn_embedding(m: torch.nn.Module):
@@ -226,13 +247,43 @@ SPEED_PRESETS = {
 }
 
 _pipelines: dict = {}
-_pipeline_lock = threading.Lock()
+# RLock (reentrant): `_get_pipeline` holds this lock across the whole load and
+# calls `_cleanup_stale_lora_pipelines`, which acquires it again. With a plain
+# Lock this deadlocked on every cold pipeline load.
+_pipeline_lock = threading.RLock()
 _dml_device = None
 _warmed_up: set = set()
 
-# LRU eviction: keep at most 2 pipelines in VRAM
-_MAX_CACHED_PIPELINES = 2
+# LRU eviction: keep at most N pipelines in VRAM (env-configurable).
+_MAX_CACHED_PIPELINES = MAX_CACHED_PIPELINES
 _pipeline_access_order: list[str] = []  # oldest → newest
+
+# Serialize GPU inference: Diffusers pipelines are not thread-safe and two
+# concurrent generations would also exhaust VRAM. Concurrent requests queue
+# here instead of corrupting state / OOM-ing.
+_inference_lock = threading.Lock()
+
+# Error signatures that indicate GPU OOM across backends (DirectML reports
+# several different strings; matching only one of them used to turn OOM into
+# an unhandled error without any retry).
+_OOM_PATTERNS = (
+    "not enough gpu video memory",
+    "out of memory",
+    "0x8007000e",
+    "e_outofmemory",
+    "video memory",
+)
+
+
+def _is_oom(err: Exception) -> bool:
+    s = str(err).lower()
+    return any(p in s for p in _OOM_PATTERNS)
+
+
+def _is_sdxl_model(model_id: str) -> bool:
+    """SDXL detection via model name + model_index.json (see detect_sdxl)."""
+    local_dir = str(Path(MODELS_DIR) / model_id.replace("/", "--"))
+    return detect_sdxl(model_id, local_dir)
 
 
 def _touch(key: str) -> None:
@@ -279,6 +330,7 @@ def _empty_dml_cache() -> None:
 def _evict_lru_unlocked() -> None:
     """Evict the oldest pipeline to free VRAM — caller must hold _pipeline_lock."""
     global _pipeline_access_order
+    evicted = False
     while len(_pipelines) >= _MAX_CACHED_PIPELINES and _pipeline_access_order:
         oldest = _pipeline_access_order[0]
         pipe = _pipelines.pop(oldest, None)
@@ -288,9 +340,11 @@ def _evict_lru_unlocked() -> None:
                 del pipe
             except Exception:
                 pass
-    if len(_pipelines) >= _MAX_CACHED_PIPELINES:
-        import gc
-        gc.collect()
+        evicted = True
+    if evicted:
+        # `del` alone leaves the blocks in the allocator's cache pool — only
+        # empty_cache actually returns them to the driver.
+        _empty_dml_cache()
 
 
 def _cleanup_stale_lora_pipelines(model_id: str, mode: str, fresh_key: str) -> None:
@@ -317,7 +371,31 @@ def _cleanup_stale_lora_pipelines(model_id: str, mode: str, fresh_key: str) -> N
         # Also prune from LRU access order
         stale_set = set(stale)
         _pipeline_access_order = [k for k in _pipeline_access_order if k not in stale_set]
-        import gc; gc.collect()
+        _empty_dml_cache()
+
+
+def _unload_other_models(keep_model_id: str) -> None:
+    """Drop every cached pipeline that does not belong to ``keep_model_id``.
+
+    Used as the first OOM-recovery step: another model sitting in the LRU
+    cache is often what pushes the current generation over the limit.
+    """
+    global _pipeline_access_order
+    with _pipeline_lock:
+        stale = [k for k in _pipelines if not k.startswith(f"{keep_model_id}:")]
+        if not stale:
+            return
+        print(f"[OOM] unloading other model(s) to free VRAM: {stale}")
+        for k in stale:
+            pipe = _pipelines.pop(k, None)
+            if pipe is not None:
+                try:
+                    del pipe
+                except Exception:
+                    pass
+        stale_set = set(stale)
+        _pipeline_access_order = [k for k in _pipeline_access_order if k not in stale_set]
+        _empty_dml_cache()
 
 
 def _evict_lru() -> None:
@@ -490,17 +568,18 @@ def _warmup_model(model_id: str, loras: list | None = None) -> float:
     if model_id in _warmed_up:
         return 0.0
     _report_vram("warmup start")
-    pipe = _get_pipeline(model_id, "txt2img", "xl" in model_id.lower(), loras)
+    pipe = _get_pipeline(model_id, "txt2img", _is_sdxl_model(model_id), loras)
     t0 = time.time()
     try:
-        _ = pipe(
-            prompt="warmup",
-            num_inference_steps=2,
-            guidance_scale=1.0,
-            width=64,
-            height=64,
-            output_type="latent",
-        )
+        with _inference_lock:
+            _ = pipe(
+                prompt="warmup",
+                num_inference_steps=2,
+                guidance_scale=1.0,
+                width=64,
+                height=64,
+                output_type="latent",
+            )
         print(f"[Warmup] {model_id} OK in {time.time() - t0:.1f}s")
     except Exception as e:
         import traceback as _tb
@@ -583,41 +662,27 @@ def _image_to_b64(img: Image.Image, fmt: str = "JPEG") -> str:
     return base64.b64encode(buf.getvalue()).decode()
 
 
-def _generate_preview(pipe, latents: torch.Tensor, is_sdxl: bool) -> str | None:
+def _generate_preview(pipe, latents: torch.Tensor, is_sdxl: bool, model_id: str) -> str | None:
     """Quick VAE decode of latents to produce a preview image, used in callbacks."""
     try:
-        # SDXL: use the dedicated CPU fp32 VAE to avoid dtype/device mismatch on DML.
+        # Both SDXL and SD 1.5 decode previews with a cached CPU fp32 VAE —
+        # no device round-trip of the live (DML) VAE on every preview step.
         if is_sdxl:
             vae = _get_cpu_vae_fp32()
         else:
-            vae = getattr(pipe, "vae", None)
-        if vae is None:
-            print("[Preview] No VAE on pipe")
-            return None
+            vae = _get_sd15_cpu_vae(pipe, model_id)
 
         # latents shape: [B, C, H, W] or [C, H, W]
         if latents.dim() == 3:
             latents = latents.unsqueeze(0)
 
-        # Always decode on CPU with fp32 latents for stability.
         lat_cpu = latents.to("cpu").float()
-        print(f"[Preview] latents shape={latents.shape} device={latents.device}")
-
-        # Move VAE to CPU fp32 as well, then restore after decode.
-        vae_orig_device = next(vae.parameters()).device
-        vae_orig_dtype = next(vae.parameters()).dtype
-        vae_cpu = vae.to("cpu").float()
 
         with torch.no_grad():
-            decoded = vae_cpu.decode(
-                lat_cpu / vae_cpu.config.scaling_factor,
+            decoded = vae.decode(
+                lat_cpu / vae.config.scaling_factor,
                 return_dict=False,
             )[0]
-
-        # Restore VAE to original device/dtype.
-        vae.to(vae_orig_device).to(vae_orig_dtype)
-
-        print(f"[Preview] decoded shape={decoded.shape} device={decoded.device}")
 
         # decoded: [B, C, H, W] -> [C, H, W] -> PIL
         img = pipe.image_processor.postprocess(decoded, output_type="pil")[0]
@@ -629,13 +694,9 @@ def _generate_preview(pipe, latents: torch.Tensor, is_sdxl: bool) -> str | None:
             ratio = max_side / max(w, h)
             img = img.resize((int(w * ratio), int(h * ratio)), Image.LANCZOS)
 
-        result = _image_to_b64(img, "JPEG")
-        print(f"[Preview] encoded len={len(result)}")
-        return result
+        return _image_to_b64(img, "JPEG")
     except Exception as e:
         print(f"[Preview] ERROR: {type(e).__name__}: {e}")
-        import traceback
-        traceback.print_exc()
         return None
 
 
@@ -663,7 +724,7 @@ async def generate_image(
     progress_queue = asyncio.Queue()
     loop = asyncio.get_running_loop()
 
-    is_sdxl = "xl" in model_id.lower()
+    is_sdxl = _is_sdxl_model(model_id)
 
     if speed_mode in SPEED_PRESETS:
         preset = SPEED_PRESETS[speed_mode]
@@ -674,7 +735,9 @@ async def generate_image(
         if not scheduler or scheduler == "dpm":
             scheduler = preset["scheduler"]
 
-    _warmup_model(model_id, loras)
+    # Warmup loads the pipeline and runs a tiny inference — run it in the
+    # executor so the event loop (and every other API endpoint) stays alive.
+    await loop.run_in_executor(None, _warmup_model, model_id, loras)
 
     _report_vram("before generate")
     pipe = _get_pipeline(model_id, mode, is_sdxl, loras)
@@ -686,18 +749,18 @@ async def generate_image(
     ref_image = None
     mask_image = None
     if image_b64 and mode in ("img2img", "inpaint"):
-        ref_image = _b64_to_image(image_b64).resize((width, height))
+        ref_image = _b64_to_image(image_b64).resize((width, height), Image.LANCZOS)
     if mask_b64 and mode == "inpaint":
-        mask_image = _b64_to_image(mask_b64).resize((width, height)).convert("L")
+        mask_image = _b64_to_image(mask_b64).resize((width, height), Image.LANCZOS).convert("L")
 
     def callback(pipeline, step_idx: int, _timestep: int, callback_kwargs):
         nonlocal first_step_time
         if step_idx == 0:
             first_step_time = int((time.time() - start_time) * 1000)
-        
+
         # Send step progress
         progress_event = {"type": "progress", "step": step_idx + 1, "total_steps": steps}
-        
+
         # Generate preview image if enabled and on stride
         latents = callback_kwargs.get("latents")
         if (
@@ -707,14 +770,14 @@ async def generate_image(
             and (step_idx + 1) % preview_stride == 0
         ):
             try:
-                preview_b64 = _generate_preview(pipeline, latents, is_sdxl)
+                preview_b64 = _generate_preview(pipeline, latents, is_sdxl, model_id)
                 if preview_b64:
                     progress_event["image"] = preview_b64
                     progress_event["preview_format"] = "jpeg"
             except Exception as e:
                 print(f"[Preview] callback error: {e}")
                 pass
-        
+
         loop.call_soon_threadsafe(
             progress_queue.put_nowait,
             progress_event,
@@ -744,51 +807,80 @@ async def generate_image(
 
     error_message = None
     result_latents = None
-    _oom_retried = False
+    # Actual output size — may shrink if the OOM ladder degrades resolution.
+    final_width, final_height = width, height
 
-    def run_inference(retry: bool = False):
-        nonlocal error_message, result_latents, first_step_time, _oom_retried, pipe
-        try:
-            import gc
-            result = pipe(**kwargs)
-            result_latents = result.images[0]
-            gc.collect()
-        except RuntimeError as e:
-            if "not enough GPU video memory" in str(e) and not retry and not _oom_retried:
-                _oom_retried = True
-                print(f"[OOM] VRAM exhausted, freeing cache and retrying once…")
-                _empty_dml_cache()
-                # Re-fetch pipeline after freeing VRAM — update outer `pipe` via nonlocal
-                pipe = _get_pipeline(model_id, mode, is_sdxl, loras)
-                _set_scheduler(pipe, scheduler)
-                try:
-                    import gc as _gc2
+    def _push_notice(msg: str) -> None:
+        loop.call_soon_threadsafe(
+            progress_queue.put_nowait,
+            {"type": "notice", "message": msg},
+        )
+
+    def run_inference():
+        """Run the blocking pipeline call with a graded OOM-recovery ladder.
+
+        Level 1 — free allocator cache, evict OTHER models' pipelines, retry.
+        Level 2 — disable the live preview (preview decoding allocates
+                  memory on its own) and retry.
+        Level 3 — txt2img only: reduce resolution by 25% and retry.
+        Beyond that, give up with an actionable message.
+        """
+        nonlocal error_message, result_latents, pipe, final_width, final_height
+        attempt = 0
+        while True:
+            try:
+                with _inference_lock:
                     result = pipe(**kwargs)
-                    result_latents = result.images[0]
-                    _gc2.collect()
+                result_latents = result.images[0]
+                import gc
+                gc.collect()
+                return
+            except RuntimeError as e:
+                if not _is_oom(e) or attempt >= 3:
+                    error_message = f"{type(e).__name__}: {e}"
+                    import traceback
+                    error_message += "\n" + "".join(traceback.format_exc())
                     return
-                except RuntimeError as e2:
-                    if "not enough GPU video memory" in str(e2):
-                        error_message = "OOM after retry: VRAM still exhausted. Try reducing resolution or closing other apps."
+                attempt += 1
+                print(f"[OOM] VRAM exhausted (attempt {attempt}), applying recovery level {attempt}")
+                _empty_dml_cache()
+                if attempt == 1:
+                    # Level 1: another cached model is often the culprit.
+                    _unload_other_models(model_id)
+                    pipe = _get_pipeline(model_id, mode, is_sdxl, loras)
+                    _set_scheduler(pipe, scheduler)
+                    _push_notice("显存不足，已清理缓存并卸载其它模型，正在重试…")
+                elif attempt == 2:
+                    # Level 2: drop the preview callback entirely.
+                    kwargs["callback_on_step_end"] = None
+                    _push_notice("显存不足，已关闭实时预览，正在重试…")
+                else:
+                    # Level 3: reduce resolution (txt2img only — for
+                    # img2img/inpaint the size follows the reference image).
+                    if mode == "txt2img":
+                        final_width = max(256, int(final_width * 0.75) // 8 * 8)
+                        final_height = max(256, int(final_height * 0.75) // 8 * 8)
+                        kwargs["width"] = final_width
+                        kwargs["height"] = final_height
+                        _push_notice(f"显存不足，降级至 {final_width}×{final_height} 重试…")
+                    else:
+                        error_message = (
+                            "OOM after retries: VRAM exhausted. Try a smaller "
+                            "reference image, lower resolution or fewer LoRAs."
+                        )
                         return
-                    error_message = f"{type(e2).__name__}: {e2}"
-                    import traceback
-                    error_message += "\n" + "".join(traceback.format_exc())
-                    return
-                except Exception as e2:
-                    error_message = f"{type(e2).__name__}: {e2}"
-                    import traceback
-                    error_message += "\n" + "".join(traceback.format_exc())
-                    return
-            error_message = f"{type(e).__name__}: {e}"
-            import traceback
-            error_message += "\n" + "".join(traceback.format_exc())
-        except Exception as e:
-            error_message = f"{type(e).__name__}: {e}"
-            import traceback
-            error_message += "\n" + "".join(traceback.format_exc())
+            except Exception as e:
+                error_message = f"{type(e).__name__}: {e}"
+                import traceback
+                error_message += "\n" + "".join(traceback.format_exc())
+                return
 
     yield {"type": "started", "total_steps": steps}
+
+    if _inference_lock.locked():
+        # Another generation currently holds the GPU — tell the client it is
+        # queued instead of showing a frozen progress bar.
+        yield {"type": "notice", "message": "另一生成任务正在使用 GPU，当前请求已排队…"}
 
     future = loop.run_in_executor(None, run_inference)
 
@@ -840,8 +932,8 @@ async def generate_image(
         "image": _image_to_b64(output_image, "JPEG"),
         "format": "jpeg",
         "seed": seed,
-        "width": width,
-        "height": height,
+        "width": final_width,
+        "height": final_height,
         "generation_time_ms": total_time,
         "first_step_time_ms": first_step_time,
         "total_steps": steps,
@@ -865,15 +957,13 @@ def unload_model(model_id: str) -> bool:
             pipe = _pipelines.pop(k, None)
             if pipe is not None:
                 del pipe
-    if keys_to_remove:
-        import gc
-        gc.collect()
-        return True
-    return False
+        if keys_to_remove:
+            # Actually return the VRAM to the driver (see _evict_lru_unlocked).
+            _empty_dml_cache()
+    return bool(keys_to_remove)
 
 
 def unload_all_models():
     with _pipeline_lock:
         _pipelines.clear()
-    import gc
-    gc.collect()
+        _empty_dml_cache()
