@@ -5,13 +5,14 @@ import {
   Loader2, Download, Save, Cpu, ChevronDown, Zap, Clock, Gauge,
   Layers, Plus,
 } from 'lucide-react';
-import { useAppStore } from '@/stores/appStore';
+import { useAppStore, type ModelInfo } from '@/stores/appStore';
 import {
   generateImage,
   type GenerateRequest,
   type SSEProgressEvent,
   type SSECompleteEvent,
   fetchLoadedModels,
+  fetchModels,
   unloadModel as apiUnloadModel,
   fetchLoras,
   preloadModel as apiPreloadModel,
@@ -23,14 +24,29 @@ export default function GeneratePage() {
   const { modelId: paramModelId } = useParams<{ modelId: string }>();
   const navigate = useNavigate();
   const {
-    settings, selectedModelId, models, loadedModelId, setLoadedModelId,
+    settings, selectedModelId, models, setModels, loadedModelId, setLoadedModelId,
     loras, setLoras, activeLoras, addActiveLora, removeActiveLora,
     updateLoraWeight, clearActiveLoras,
   } = useAppStore();
 
   const modelId = paramModelId || selectedModelId || '';
 
+  // Only directly generatable models belong in the selector — picking a
+  // downloading/converting/error entry would just fail with an obscure error.
+  const selectableModels = models.filter(
+    (m) => m.status === 'ready' || m.status === 'single_file',
+  );
+
   const [switchingModel, setSwitchingModel] = useState(false);
+
+  // The store is only populated by the model list page — fetch it ourselves
+  // when the user lands here directly (e.g. hard refresh on /generate/:id).
+  useEffect(() => {
+    if (models.length > 0) return;
+    fetchModels().then((data) => {
+      if (data?.models) setModels(data.models as ModelInfo[]);
+    }).catch(() => {});
+  }, [models.length, setModels]);
 
   useEffect(() => {
     const pollLoaded = async () => {
@@ -77,7 +93,9 @@ export default function GeneratePage() {
       }
       setSwitchingModel(false);
     }
-    navigate(`/generate/${newModelId}`);
+    // Encode: repo IDs contain "/" and would otherwise not match the
+    // /generate/:modelId route.
+    navigate(`/generate/${encodeURIComponent(newModelId)}`);
   };
 
   const handleUnloadModel = async () => {
@@ -284,7 +302,7 @@ export default function GeneratePage() {
               className="w-full appearance-none bg-surface-light border border-surface-border rounded-lg px-3 py-2 pr-8 text-sm text-white focus:outline-none focus:border-neon-purple transition-colors disabled:opacity-50"
             >
               <option value="" disabled>选择模型...</option>
-              {models.map((m) => (
+              {selectableModels.map((m) => (
                 <option key={m.id} value={m.id}>
                   {m.name} ({m.type === 'sdxl' ? 'SDXL' : 'SD 1.5'} · {m.size_mb}MB)
                 </option>

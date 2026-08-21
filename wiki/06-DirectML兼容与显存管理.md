@@ -88,7 +88,7 @@ SDXL 模式下会遍历 UNet 与 VAE 的全部 `nn.Conv2d` 打补丁。
 | 新建 pipeline 前 | `_evict_lru_unlocked()` | 持锁循环逐出最旧，直到数量 < 上限 |
 | LoRA 组合切换后 | `_cleanup_stale_lora_pipelines(model_id, mode, fresh_key)` | 前缀匹配 `{model_id}:{mode}:<` 且 ≠ 新键的全部驱逐（**立即**释放旧 LoRA pipeline 显存） |
 | OOM 恢复 L1 | `_unload_other_models(keep_model_id)` | 驱逐所有非当前模型的缓存 pipeline（其它模型常是显存超限元凶） |
-| 显式卸载 API | `unload_model()` / `unload_all_models()` | 按 `model_id:` 前缀或全量清空 |
+| 显式卸载 API | `unload_model()` / `unload_all_models()` | 按 `model_id:` 前缀或全量清空；同时清理对应的 SD1.5 CPU VAE 副本缓存（`_cpu_vae_cache_sd15`，每个 ~335MB 系统内存，避免卸载后泄漏） |
 
 > **显存真正归还**：以上所有逐出路径在 `del pipe` 后都会调用 `_empty_dml_cache()`。仅 `del` + `gc.collect()` 只会把块还给 torch 分配器的缓存池，驱动层显存占用并不下降——`empty_cache` 才真正释放。
 

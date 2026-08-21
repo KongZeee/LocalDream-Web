@@ -67,6 +67,13 @@ async def get_models() -> dict:
     # downloaded, manually placed models disappeared from the list.
     scanned = await _scan_local_models()
     scanned_by_id = {m["id"]: m for m in scanned}
+    # Stems of visible single-file checkpoints. A model_cache row with the
+    # same id is a leftover from a FAILED conversion — the single-file entry
+    # (which the user can retry from) wins; the row must not surface as a
+    # phantom "error" model in the list.
+    single_file_stems = {
+        Path(m["id"]).stem for m in scanned if m["status"] == "single_file"
+    }
 
     db = await get_db()
     try:
@@ -76,6 +83,8 @@ async def get_models() -> dict:
         models = []
         for row in rows:
             model_id = row["model_id"]
+            if model_id in single_file_stems:
+                continue
             local = scanned_by_id.get(model_id)
             models.append({
                 "id": model_id,
@@ -94,7 +103,14 @@ async def get_models() -> dict:
 
         cursor = await db.execute("SELECT value FROM settings WHERE key='default_model'")
         default_rows = await cursor.fetchall()
-        default_model = default_rows[0]["value"] if default_rows else (models[0]["id"] if models else "")
+        if default_rows:
+            default_model = default_rows[0]["value"]
+        else:
+            # Prefer a directly usable model over e.g. a downloading one.
+            default_model = next(
+                (m["id"] for m in models if m["status"] in ("ready", "single_file")),
+                models[0]["id"] if models else "",
+            )
 
         return {"models": models, "default_model": default_model}
     finally:
@@ -238,6 +254,11 @@ async def _run_download(model_id: str, local_dir: Path):
 
 async def delete_model(model_id: str):
     import shutil
+    # Refuse to delete while a background conversion is reading the file —
+    # removing the source mid-conversion crashes the task and corrupts state.
+    stem = Path(model_id).stem
+    if model_id in _active_conversions or stem in _active_conversions:
+        raise RuntimeError(f"模型正在转换中，请稍后再删除: {model_id}")
     local = Path(MODELS_DIR) / model_id.replace("/", "--")
     if local.is_dir():
         shutil.rmtree(local)
@@ -292,6 +313,11 @@ async def convert_model(model_id: str):
 
 async def _run_conversion(src: str, out_dir: Path, stem: str):
     loop = asyncio.get_running_loop()
+    # Whether the output dir predates this conversion (re-convert). If it
+    # did NOT exist, a failure must remove the partial directory — a broken
+    # dir with model_index.json would otherwise be scanned as a "ready"
+    # model that crashes on load.
+    out_dir_existed = out_dir.exists()
 
     def _do():
         import torch
@@ -306,6 +332,9 @@ async def _run_conversion(src: str, out_dir: Path, stem: str):
         import traceback
         print(f"[Convert] {stem} failed: {e}")
         traceback.print_exc()
+        if not out_dir_existed:
+            import shutil
+            shutil.rmtree(out_dir, ignore_errors=True)
         _active_conversions.discard(stem)
         db = await get_db()
         try:

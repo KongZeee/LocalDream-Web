@@ -159,10 +159,12 @@ data: {"type": "complete", "image": "<base64 jpeg>", "format": "jpeg", "seed": 1
 → 立即返回 `{"status": "converting", "model_id": ...}`；后台用 `DiffusionPipeline.from_single_file()` + `save_pretrained()` 拆包为 `{MODELS_DIR}/{stem}/` Diffusers 目录（**保留源文件**），轮询 `GET /api/models` 观察状态。文件不存在返回 **404**。
 
 > 转换是一次性成本（加载整个 checkpoint → 重新落盘），期间约需 2×模型体积的磁盘空间与大量内存。转换后的模型加载速度远快于单文件直载。
+>
+> **失败行为**：后台转换失败时会清理本次新建的残缺输出目录（避免被扫描成"就绪"的坏模型），源文件以 `single_file` 状态重新出现在列表中可直接重试；不会残留幽灵 `error` 条目（`get_models` 会跳过与可见单文件同 stem 的缓存行）。
 
 ### `DELETE /api/models/{model_id}`
 
-删除本地模型（Diffusers 目录 rmtree / 单文件 checkpoint unlink）与缓存记录 → `{"status": "deleted"}`。
+删除本地模型（Diffusers 目录 rmtree / 单文件 checkpoint unlink）与缓存记录 → `{"status": "deleted"}`。**转换进行中**删除对应模型返回 **409**（避免后台任务读到一半文件被删）。
 
 ## 3. LoRA 接口
 

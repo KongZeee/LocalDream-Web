@@ -972,6 +972,9 @@ def unload_model(model_id: str) -> bool:
         if keys_to_remove:
             # Actually return the VRAM to the driver (see _evict_lru_unlocked).
             _empty_dml_cache()
+    # Drop the cached CPU fp32 VAE copy too (~335MB of RAM per SD 1.5
+    # model) — otherwise it lingers forever after an explicit unload.
+    _cpu_vae_cache_sd15.pop(model_id, None)
     return bool(keys_to_remove)
 
 
@@ -979,3 +982,4 @@ def unload_all_models():
     with _pipeline_lock:
         _pipelines.clear()
         _empty_dml_cache()
+    _cpu_vae_cache_sd15.clear()

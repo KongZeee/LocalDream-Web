@@ -13,6 +13,7 @@ export default function ModelListPage() {
   const [downloading, setDownloading] = useState(false);
   const [showDownload, setShowDownload] = useState(false);
   const [unloadingId, setUnloadingId] = useState<string | null>(null);
+  const [actionError, setActionError] = useState<string | null>(null);
 
   useEffect(() => {
     loadModels();
@@ -33,7 +34,11 @@ export default function ModelListPage() {
       const data = await fetchModels();
       if (data?.models) {
         setModels(data.models as ModelInfo[]);
-        if (data.default_model) setSelectedModelId(data.default_model);
+        // Only apply the default when nothing is selected yet — otherwise
+        // the 5s status poll would keep resetting a model the user picked.
+        if (data.default_model && !useAppStore.getState().selectedModelId) {
+          setSelectedModelId(data.default_model);
+        }
       }
     } catch {
       if (!silent) setModels([]);
@@ -45,6 +50,7 @@ export default function ModelListPage() {
   async function handleDownload() {
     if (!downloadId.trim()) return;
     setDownloading(true);
+    setActionError(null);
     try {
       // Returns immediately — actual download runs in the background and
       // the list polls for status updates.
@@ -52,30 +58,33 @@ export default function ModelListPage() {
       setShowDownload(false);
       setDownloadId('');
       await loadModels();
-    } catch {
-      // handled by UI
+    } catch (e) {
+      setActionError(`下载启动失败：${(e as Error).message}`);
     } finally {
       setDownloading(false);
     }
   }
 
   async function handleConvert(modelId: string) {
+    setActionError(null);
     try {
       // Returns immediately — conversion runs in the background and the
       // list polls for status updates.
       await convertModel(modelId);
       await loadModels(true);
-    } catch {
-      // handled by UI
+    } catch (e) {
+      setActionError(`转换启动失败：${(e as Error).message}`);
     }
   }
 
   async function handleDelete(modelId: string) {
+    if (!window.confirm(`确定删除模型「${modelId}」？该操作不可恢复。`)) return;
+    setActionError(null);
     try {
       await deleteModel(modelId);
       await loadModels();
-    } catch {
-      // handled by UI
+    } catch (e) {
+      setActionError(`删除失败：${(e as Error).message}`);
     }
   }
 
@@ -180,6 +189,12 @@ export default function ModelListPage() {
               取消
             </button>
           </div>
+        </div>
+      )}
+
+      {actionError && (
+        <div className="mb-6 p-3 bg-red-500/10 border border-red-500/30 rounded-lg animate-slide-up">
+          <p className="text-xs text-red-400">{actionError}</p>
         </div>
       )}
 

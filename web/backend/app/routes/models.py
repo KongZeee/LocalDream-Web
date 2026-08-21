@@ -88,5 +88,8 @@ async def remove_model(model_id: str):
     try:
         await delete_model(model_id)
         return {"status": "deleted"}
+    except RuntimeError as e:
+        # e.g. deletion refused while a background conversion is running.
+        raise HTTPException(409, str(e))
     except Exception as e:
         raise HTTPException(500, str(e))
