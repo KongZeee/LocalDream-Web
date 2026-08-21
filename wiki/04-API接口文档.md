@@ -9,14 +9,15 @@
 | 方法 | 端点 | 说明 |
 |------|------|------|
 | POST | `/api/generate` | 生图（SSE 流式响应） |
-| GET | `/api/health` | 健康检查 |
-| GET | `/api/models` | 模型列表 |
+| GET | `/api/health` | 健康检查（真实 GPU 探测） |
+| GET | `/api/models` | 模型列表（本地扫描 + 下载/转换状态合并） |
 | GET | `/api/models/loaded` | 已加载模型 |
 | POST | `/api/models/unload` | 卸载模型 |
 | POST | `/api/models/unload-all` | 卸载全部 |
-| POST | `/api/models/{model_id}/preload` | 预加载模型 |
-| POST | `/api/models/download` | 下载模型 |
-| DELETE | `/api/models/{model_id}` | 删除模型 |
+| POST | `/api/models/{model_id}/preload` | 预加载模型（含真实预热推理） |
+| POST | `/api/models/download` | 下载模型（后台执行，立即返回） |
+| POST | `/api/models/convert` | 单文件 checkpoint 转 Diffusers（后台执行，立即返回） |
+| DELETE | `/api/models/{model_id}` | 删除模型（目录或单文件） |
 | GET | `/api/loras` | LoRA 列表（完整） |
 | GET | `/api/loras/names` | LoRA 列表（轻量） |
 | GET | `/api/history` | 历史分页 |
@@ -64,6 +65,7 @@
 data: {"type": "started", "total_steps": 15}
 data: {"type": "progress", "step": 1, "total_steps": 15}
 data: {"type": "progress", "step": 2, "total_steps": 15, "image": "<base64 jpeg>", "preview_format": "jpeg"}
+data: {"type": "notice", "message": "显存不足，已关闭实时预览，正在重试…"}
 ...
 data: {"type": "complete", "image": "<base64 jpeg>", "format": "jpeg", "seed": 12345,
        "width": 512, "height": 512, "generation_time_ms": 45123,
@@ -73,13 +75,15 @@ data: {"type": "complete", "image": "<base64 jpeg>", "format": "jpeg", "seed": 1
 | 事件类型 | 字段 | 说明 |
 |---------|------|------|
 | `started` | `total_steps` | 推理开始（pipeline 加载/预热完成） |
+| `notice` | `message` | **非致命状态提示**：GPU 排队、OOM 降级（清理缓存/关预览/降分辨率）等；前端以黄色提示条展示，生图继续 |
 | `progress` | `step`, `total_steps`, `image?`, `preview_format?` | 每步回调；`image` 为 ≤256px JPEG 预览（受 `show_preview`/`preview_stride` 控制） |
-| `complete` | `image`, `format`, `seed`, `width`, `height`, `generation_time_ms`, `first_step_time_ms`, `total_steps` | 完成；后端此时已自动写入历史 |
-| `error` | `message` | 失败（含 OOM 重试后的提示、异常堆栈文本） |
+| `complete` | `image`, `format`, `seed`, `width`, `height`, `generation_time_ms`, `first_step_time_ms`, `total_steps` | 完成；`width/height` 为**实际输出尺寸**（OOM 降级时可能小于请求尺寸） |
+| `error` | `message` | 失败（含 OOM 各级恢复尝试后的提示、异常堆栈文本） |
 
 > 行为细节：
-> - `complete` 到达后，后端异步写入历史记录（落盘失败不影响已返回的图片）。
-> - OOM 时后端自动清缓存重试一次，失败才发 `error`。
+> - `complete` 事件**先发给客户端**，随后后端才写历史记录（落盘失败不影响已返回的图片）。
+> - GPU 推理全局串行化（`_inference_lock`）：并发请求会排队，排队中先收到 `notice` 提示。
+> - OOM 分级降级：L1 清缓存+卸载其它模型 → L2 关闭实时预览 → L3 txt2img 分辨率 ×0.75；每级发 `notice`，全部失败才发 `error`。
 > - 预览解码失败仅打日志，事件仍会照常发送（无 `image` 字段）。
 
 ### `GET /api/health`
@@ -88,13 +92,13 @@ data: {"type": "complete", "image": "<base64 jpeg>", "format": "jpeg", "seed": 1
 {
   "status": "ok",
   "gpu_available": true,
-  "gpu_name": "AMD GPU (DirectML)",
+  "gpu_name": "AMD Radeon RX 5700 XT (DirectML)",
   "loaded_model": "aom3a1b",
   "models_dir": "D:/.../web/backend/data/models"
 }
 ```
 
-> 注意：`gpu_available` 当前固定为 `true`、`gpu_name` 固定为 `"AMD GPU (DirectML)"`，是简化实现，不代表真实探测结果。
+> GPU 信息为真实探测（`system.get_gpu_info()`）：CUDA 设备名 → `torch_directml.device_name(0)` → `"CPU"`。
 
 ## 2. 模型接口
 
@@ -104,13 +108,25 @@ data: {"type": "complete", "image": "<base64 jpeg>", "format": "jpeg", "seed": 1
 {
   "models": [
     { "id": "aom3a1b", "name": "aom3a1b", "type": "sd15",
-      "status": "ready", "size_mb": 4096, "preview_url": "" }
+      "status": "ready", "size_mb": 4096, "preview_url": "" },
+    { "id": "anima_v29.safetensors", "name": "anima_v29.safetensors", "type": "sdxl",
+      "status": "single_file", "size_mb": 6553, "preview_url": "" }
   ],
   "default_model": "aom3a1b"
 }
 ```
 
-逻辑：优先返回 `model_cache` 表记录；表为空时扫描 `MODELS_DIR` 下含 `model_index.json` 的目录。
+**status 取值：**
+
+| 值 | 含义 |
+|----|------|
+| `ready` | Diffusers 目录就绪（磁盘存在即 ready，无论缓存表说什么） |
+| `single_file` | 单文件 checkpoint（`.safetensors`/`.ckpt`），**可直接生成**（后端 `from_single_file` 加载） |
+| `downloading` | 后台下载中 |
+| `converting` | 后台转换为 Diffusers 格式中 |
+| `error` | 下载/转换失败 |
+
+逻辑：本地扫描（Diffusers 目录 + 单文件 checkpoint，类型经 `detect_sdxl` 三级探测）与 `model_cache` 表状态**合并**返回。
 
 ### `GET /api/models/loaded`
 
@@ -134,11 +150,19 @@ data: {"type": "complete", "image": "<base64 jpeg>", "format": "jpeg", "seed": 1
 
 请求体：`{"model_id": "runwayml/stable-diffusion-v1-5", "model_type": "sd15"}`
 
-> ⚠️ 该接口**同步等待整个 snapshot_download 完成**才响应（下载写入 `model_cache` 表后返回 `{"status": "downloading"}`）。大模型下载期间 HTTP 请求会长时间挂起，前端按阻塞式 UI 处理。
+→ 立即返回 `{"status": "downloading", "model_id": ...}`；实际下载在后台执行，前端轮询 `GET /api/models` 观察状态（`downloading` → `ready` / `error`）。
+
+### `POST /api/models/convert`
+
+请求体：`{"model_id": "anima_v29.safetensors"}`（`model_id` 为 `MODELS_DIR` 下的单文件 checkpoint 文件名）
+
+→ 立即返回 `{"status": "converting", "model_id": ...}`；后台用 `DiffusionPipeline.from_single_file()` + `save_pretrained()` 拆包为 `{MODELS_DIR}/{stem}/` Diffusers 目录（**保留源文件**），轮询 `GET /api/models` 观察状态。文件不存在返回 **404**。
+
+> 转换是一次性成本（加载整个 checkpoint → 重新落盘），期间约需 2×模型体积的磁盘空间与大量内存。转换后的模型加载速度远快于单文件直载。
 
 ### `DELETE /api/models/{model_id}`
 
-删除本地模型目录与缓存记录 → `{"status": "deleted"}`。
+删除本地模型（Diffusers 目录 rmtree / 单文件 checkpoint unlink）与缓存记录 → `{"status": "deleted"}`。
 
 ## 3. LoRA 接口
 
@@ -223,7 +247,7 @@ data: {"type": "complete", "image": "<base64 jpeg>", "format": "jpeg", "seed": 1
 }
 ```
 
-探测链：CUDA 显存 → psutil → Win32 `GlobalMemoryStatusEx`（DirectML 模式下 GPU 字段实际是系统物理内存）。内存不可探测时对应字段为 `null`。
+探测链：CUDA 显存 → psutil → Win32 `GlobalMemoryStatusEx`（DirectML 模式下 GPU 字段实际是系统物理内存）。内存不可探测时对应字段为 `null`。`gpu_name` 为真实探测（`get_gpu_info()`：CUDA 设备名 → `torch_directml.device_name(0)`，如 `"AMD Radeon RX 5700 XT (DirectML)"` → `"CPU"`）。
 
 ## 7. 超分接口
 

@@ -424,17 +424,8 @@ def _get_pipeline(model_id: str, mode: str, is_sdxl: bool, loras: list | None = 
 
         model_path = Path(MODELS_DIR) / model_id.replace("/", "--")
         is_local = model_path.exists()
+        is_ckpt_file = is_local and model_path.is_file()
         model_path_str = str(model_path) if is_local else model_id
-
-        pipe_kwargs = {
-            "torch_dtype": torch.float16,
-            "safety_checker": None,
-            "requires_safety_checker": False,
-            "low_cpu_mem_usage": True,
-            "use_safetensors": True,
-        }
-        if is_local:
-            pipe_kwargs["local_files_only"] = True
 
         if is_sdxl:
             if mode == "img2img":
@@ -451,7 +442,28 @@ def _get_pipeline(model_id: str, mode: str, is_sdxl: bool, loras: list | None = 
             else:
                 pipe_cls = StableDiffusionPipeline
 
-        pipe = pipe_cls.from_pretrained(model_path_str, **pipe_kwargs)
+        if is_ckpt_file:
+            # Single-file checkpoint (.safetensors / .ckpt): load directly via
+            # from_single_file (in-memory conversion on every cold load).
+            # For regular use, converting to a Diffusers directory first via
+            # POST /api/models/convert is recommended (much faster loads).
+            sf_kwargs = {"torch_dtype": torch.float16}
+            if not is_sdxl:
+                sf_kwargs["safety_checker"] = None
+                sf_kwargs["requires_safety_checker"] = False
+            print(f"[Generator] Loading single-file checkpoint: {model_path_str} (SDXL={is_sdxl})")
+            pipe = pipe_cls.from_single_file(model_path_str, **sf_kwargs)
+        else:
+            pipe_kwargs = {
+                "torch_dtype": torch.float16,
+                "safety_checker": None,
+                "requires_safety_checker": False,
+                "low_cpu_mem_usage": True,
+                "use_safetensors": True,
+            }
+            if is_local:
+                pipe_kwargs["local_files_only"] = True
+            pipe = pipe_cls.from_pretrained(model_path_str, **pipe_kwargs)
 
         if is_sdxl:
             try:

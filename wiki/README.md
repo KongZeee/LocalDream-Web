@@ -15,7 +15,7 @@
 | [03-前端模块详解](./03-前端模块详解.md) | React 前端页面、组件、状态管理、API 封装说明 |
 | [04-API接口文档](./04-API接口文档.md) | 全部 REST 端点、请求/响应模型、SSE 流式协议 |
 | [05-数据存储设计](./05-数据存储设计.md) | SQLite 表结构、数据目录布局、历史记录持久化流程 |
-| [06-DirectML兼容与显存管理](./06-DirectML兼容与显存管理.md) | AMD RDNA 1 兼容补丁、OOM 自动恢复、LRU 显存缓存（项目核心技术） |
+| [06-DirectML兼容与显存管理](./06-DirectML兼容与显存管理.md) | AMD RDNA 1 兼容补丁、OOM 分级降级、LRU 显存缓存（项目核心技术） |
 | [07-依赖关系](./07-依赖关系.md) | 前后端依赖清单、模块依赖图、第三方库版本要求 |
 | [08-部署与运行指南](./08-部署与运行指南.md) | 环境要求、安装步骤、启动方式、环境变量配置、生产构建 |
 
@@ -27,11 +27,12 @@
 
 - **无需 NVIDIA 显卡**：通过 `torch_directml` 在 AMD 显卡上原生运行（DirectML 后端）
 - **完整生图功能**：文生图（txt2img）、图生图（img2img）、局部重绘（inpaint）、实时中间预览（SSE 流式）
-- **模型管理**：SD 1.5 / SDXL 多模型切换、预加载预热、一键卸载、HuggingFace 下载
+- **模型管理**：SD 1.5 / SDXL 多模型切换、预加载（真实预热）、一键卸载、HuggingFace 后台下载
+- **单文件模型支持**：`.safetensors`/`.ckpt` 直接生成（`from_single_file` 直载），或一键后台拆包为 Diffusers 目录；SDXL 架构按配置文件智能识别（Anima/Pony 等不含 "xl" 的名字也正确分派）
 - **LoRA 支持**：多 LoRA 叠加、实时权重调节、切换组合时自动清理旧 pipeline 显存
 - **辅助能力**：生图历史（SQLite + 缩略图）、RealESRGAN 4x 超分放大、GPU/内存实时状态栏
 - **RDNA 1 专项优化**：针对 RX 5000 系列 DirectML 的算子 bug 内置 CPU 回退补丁
-- **显存保护**：VAE Slicing/Tiling、Attention Slicing、OOM 自动重试、最多缓存 2 个 pipeline 的 LRU 逐出策略
+- **显存保护**：VAE Slicing/Tiling、Attention Slicing、GPU 推理串行化、OOM 分级降级（清缓存→关预览→降分辨率，`notice` 事件实时告知）、LRU 逐出（上限可用 `LOCAL_DREAM_MAX_PIPELINES` 调整）
 
 ## 技术栈一览
 

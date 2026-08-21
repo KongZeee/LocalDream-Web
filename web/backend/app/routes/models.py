@@ -1,6 +1,6 @@
 from fastapi import APIRouter, HTTPException
 from pydantic import BaseModel
-from app.services.model_manager import get_models, download_model, delete_model, preload_model
+from app.services.model_manager import get_models, download_model, delete_model, preload_model, convert_model
 from app.services.generator import unload_model, unload_all_models, get_loaded_models, get_loaded_model
 
 router = APIRouter(prefix="/api/models", tags=["models"])
@@ -9,6 +9,10 @@ router = APIRouter(prefix="/api/models", tags=["models"])
 class DownloadRequest(BaseModel):
     model_id: str
     model_type: str = "sd15"
+
+
+class ConvertRequest(BaseModel):
+    model_id: str
 
 
 class UnloadRequest(BaseModel):
@@ -61,6 +65,20 @@ async def download(req: DownloadRequest):
     try:
         await download_model(req.model_id, req.model_type)
         return {"status": "downloading", "model_id": req.model_id}
+    except Exception as e:
+        raise HTTPException(500, str(e))
+
+
+@router.post("/convert")
+async def convert(req: ConvertRequest):
+    """Convert a single-file checkpoint (.safetensors/.ckpt) into a Diffusers
+    directory layout. Runs in the background — poll GET /api/models for
+    status ("converting" → "ready"). The source file is kept."""
+    try:
+        await convert_model(req.model_id)
+        return {"status": "converting", "model_id": req.model_id}
+    except FileNotFoundError:
+        raise HTTPException(404, f"Single-file checkpoint not found: {req.model_id}")
     except Exception as e:
         raise HTTPException(500, str(e))
 

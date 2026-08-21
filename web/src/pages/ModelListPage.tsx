@@ -1,8 +1,8 @@
 import { useState, useEffect } from 'react';
 import { useNavigate } from 'react-router-dom';
-import { Trash2, CheckCircle, AlertCircle, Loader2, Plus, PowerOff } from 'lucide-react';
+import { Trash2, CheckCircle, AlertCircle, Loader2, Plus, PowerOff, FileCog } from 'lucide-react';
 import { useAppStore, type ModelInfo } from '@/stores/appStore';
-import { fetchModels, downloadModel, deleteModel, unloadModel } from '@/utils/api';
+import { fetchModels, downloadModel, deleteModel, unloadModel, convertModel } from '@/utils/api';
 
 export default function ModelListPage() {
   const navigate = useNavigate();
@@ -18,11 +18,11 @@ export default function ModelListPage() {
     loadModels();
   }, []);
 
-  // The backend downloads in the background — poll while anything is
-  // still in "downloading" state.
+  // The backend downloads/converts in the background — poll while anything
+  // is still in progress.
   useEffect(() => {
-    const hasDownloading = models.some((m) => m.status === 'downloading');
-    if (!hasDownloading) return;
+    const busy = models.some((m) => m.status === 'downloading' || m.status === 'converting');
+    if (!busy) return;
     const t = setInterval(() => loadModels(true), 5000);
     return () => clearInterval(t);
   }, [models]);
@@ -59,6 +59,17 @@ export default function ModelListPage() {
     }
   }
 
+  async function handleConvert(modelId: string) {
+    try {
+      // Returns immediately — conversion runs in the background and the
+      // list polls for status updates.
+      await convertModel(modelId);
+      await loadModels(true);
+    } catch {
+      // handled by UI
+    }
+  }
+
   async function handleDelete(modelId: string) {
     try {
       await deleteModel(modelId);
@@ -80,8 +91,12 @@ export default function ModelListPage() {
     }
   }
 
+  // Single-file checkpoints can generate directly (loaded via from_single_file
+  // on the backend); "ready" Diffusers dirs are the fast path.
+  const selectable = (status: string) => status === 'ready' || status === 'single_file';
+
   function handleSelect(model: ModelInfo) {
-    if (model.status === 'ready') {
+    if (selectable(model.status)) {
       setSelectedModelId(model.id);
       navigate(`/generate/${encodeURIComponent(model.id)}`);
     }
@@ -91,6 +106,8 @@ export default function ModelListPage() {
     switch (status) {
       case 'ready': return <CheckCircle size={14} className="text-neon-cyan" />;
       case 'downloading': return <Loader2 size={14} className="text-neon-purple animate-spin" />;
+      case 'converting': return <Loader2 size={14} className="text-neon-purple animate-spin" />;
+      case 'single_file': return <FileCog size={14} className="text-neon-cyan" />;
       case 'error': return <AlertCircle size={14} className="text-red-400" />;
       default: return null;
     }
@@ -100,6 +117,8 @@ export default function ModelListPage() {
     switch (status) {
       case 'ready': return '就绪';
       case 'downloading': return '下载中';
+      case 'converting': return '转换中';
+      case 'single_file': return '单文件';
       case 'error': return '错误';
       default: return '未知';
     }
@@ -181,7 +200,7 @@ export default function ModelListPage() {
               key={model.id}
               onClick={() => handleSelect(model)}
               className={`group relative p-4 bg-surface-light border rounded-lg transition-all duration-300 ${
-                model.status === 'ready'
+                selectable(model.status)
                   ? 'border-surface-border hover:border-neon-purple/50 hover:shadow-glow-purple cursor-pointer'
                   : 'border-surface-border opacity-60'
               }`}
@@ -203,6 +222,18 @@ export default function ModelListPage() {
                       {statusIcon(model.status)}
                     </div>
                     <div className="flex items-center gap-2 flex-shrink-0">
+                      {model.status === 'single_file' && (
+                        <button
+                          onClick={(e) => {
+                            e.stopPropagation();
+                            handleConvert(model.id);
+                          }}
+                          className="p-1.5 rounded text-gray-500 hover:text-neon-cyan hover:bg-neon-cyan/10 transition-all duration-200"
+                          title="转换为 Diffusers 格式（拆分为目录，加快后续加载）"
+                        >
+                          <FileCog size={14} />
+                        </button>
+                      )}
                       {loadedModelId === model.id && (
                         <button
                           onClick={(e) => {

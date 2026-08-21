@@ -161,6 +161,13 @@ export async function downloadModel(modelId: string, modelType: string) {
   });
 }
 
+export async function convertModel(modelId: string) {
+  return request<{ status: string; model_id: string }>('/api/models/convert', {
+    method: 'POST',
+    body: JSON.stringify({ model_id: modelId }),
+  });
+}
+
 export async function deleteModel(modelId: string) {
   return request(`/api/models/${encodeURIComponent(modelId)}`, { method: 'DELETE' });
 }

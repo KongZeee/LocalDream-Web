@@ -77,34 +77,37 @@ SDXL 模式下会遍历 UNet 与 VAE 的全部 `nn.Conv2d` 打补丁。
 ### 4.1 缓存结构
 
 - 缓存键：`"{model_id}:{mode}"`，带 LoRA 时追加 `":<{id:weight,id:weight,...}>"`（组合按 id 排序，权重参与键）→ **不同 LoRA 组合 = 不同 pipeline 实例**，互不污染
-- 容量：`_MAX_CACHED_PIPELINES = 2`（最多两个 pipeline 驻留显存）
+- 容量：`_MAX_CACHED_PIPELINES`（默认 2；环境变量 `LOCAL_DREAM_MAX_PIPELINES` 可调，16GB+ 显卡建议调大）
 - 顺序表 `_pipeline_access_order`（旧→新）维护 LRU；`_touch()` 命中即移到末尾
+- **锁策略**：`_pipeline_lock` 为 `RLock`（可重入——`_get_pipeline` 持锁加载时内部会再调用 `_cleanup_stale_lora_pipelines` 拿同一把锁）；`_inference_lock`（普通 Lock）串行化所有 GPU 推理——pipeline 非线程安全且并发推理必然超显存，并发请求排队等待（客户端收到 `notice` 排队提示）
 
-### 4.2 逐出时机（三处）
+### 4.2 逐出时机（四处）与显存归还
 
 | 时机 | 函数 | 行为 |
 |------|------|------|
-| 新建 pipeline 前 | `_evict_lru_unlocked()` | 持锁循环逐出最旧，直到数量 < 2 |
+| 新建 pipeline 前 | `_evict_lru_unlocked()` | 持锁循环逐出最旧，直到数量 < 上限 |
 | LoRA 组合切换后 | `_cleanup_stale_lora_pipelines(model_id, mode, fresh_key)` | 前缀匹配 `{model_id}:{mode}:<` 且 ≠ 新键的全部驱逐（**立即**释放旧 LoRA pipeline 显存） |
-| 显式卸载 API | `unload_model()` / `unload_all_models()` | 按 `model_id:` 前缀或全量清空，随后 `gc.collect()` |
+| OOM 恢复 L1 | `_unload_other_models(keep_model_id)` | 驱逐所有非当前模型的缓存 pipeline（其它模型常是显存超限元凶） |
+| 显式卸载 API | `unload_model()` / `unload_all_models()` | 按 `model_id:` 前缀或全量清空 |
 
-> 直接 `del pipe` 后依赖引用计数 + GC 回收显存；`_evict_lru_unlocked` 在删完仍超额时再补一次 `gc.collect()`。
+> **显存真正归还**：以上所有逐出路径在 `del pipe` 后都会调用 `_empty_dml_cache()`。仅 `del` + `gc.collect()` 只会把块还给 torch 分配器的缓存池，驱动层显存占用并不下降——`empty_cache` 才真正释放。
 
-### 4.3 OOM 自动恢复
+### 4.3 OOM 分级降级阶梯
 
-`run_inference()`（线程池内执行）的异常处理链：
+`run_inference()`（线程池内执行，持 `_inference_lock`）捕获 `_is_oom()`（宽匹配 `not enough gpu video memory` / `out of memory` / `0x8007000e` / `e_outofmemory` / `video memory`，大小写不敏感——DirectML 的 OOM 有多种报错面目，只匹配一种会漏掉）后按代价从小到大逐级恢复：
 
 ```
-RuntimeError("not enough GPU video memory")
-  └─ 未重试过？
-       ├─ _empty_dml_cache()   # torch.cuda.empty_cache + torch_directml.empty_cache + gc.collect
-       ├─ 重新 _get_pipeline() + _set_scheduler()   # 可能已触发 LRU 逐出
-       └─ 再推理一次
-            ├─ 成功 → 正常返回
-            └─ 仍 OOM → error_message = "OOM after retry: ... Try reducing resolution ..."
+OOM 捕获（宽匹配）
+  ├─ L1：_empty_dml_cache() + _unload_other_models()（驱逐其它模型）→ 重试
+  │        └─ 发 notice：「显存不足，已清理缓存并卸载其它模型，正在重试…」
+  ├─ L2：kwargs["callback_on_step_end"] = None（关闭实时预览）→ 重试
+  │        └─ 发 notice：「显存不足，已关闭实时预览，正在重试…」
+  ├─ L3：txt2img 分辨率 ×0.75（对齐 8 的倍数，下限 256）→ 重试
+  │        └─ 发 notice：「显存不足，降级至 W×H 重试…」
+  └─ 仍失败 → error 事件（含可操作建议；img2img/inpaint 不做 L3，提示换更小参考图）
 ```
 
-每个请求只重试一次（`_oom_retried` 标志），避免死循环。其他异常一律转 `{type(e).__name__}: {e}` + 完整堆栈文本进 `error` 事件。
+每次成功降级后照常推理；`complete` 事件中的 `width/height` 反映**实际输出尺寸**（可能小于请求值）。非 OOM 异常一律转 `{type(e).__name__}: {e}` + 完整堆栈文本进 `error` 事件。
 
 ### 4.4 显存观测
 
@@ -116,9 +119,9 @@ RuntimeError("not enough GPU video memory")
 `_warmup_model(model_id, loras)`：
 
 - `_warmed_up` 集合去重，每个模型进程内只预热一次
-- 预热推理：64×64、2 步、guidance 1.0、`output_type="latent"` —— 以最小代价触发权重传输、shader 编译、内存池分配等一次性开销
+- 预热推理（持 `_inference_lock`）：64×64、2 步、guidance 1.0、`output_type="latent"` —— 以最小代价触发权重传输、shader 编译、内存池分配等一次性开销
 - 失败只打日志不阻断（真实生图仍会尝试）
-- `preload_model()`（模型管理服务）在预加载后直接把模型加入 `_warmed_up`，跳过后续预热
+- `preload_model()`（模型管理服务）现调用 `_warmup_model()` 本身——**真预热**（加载 + 推理）；生图路径中 warmup 亦移入线程池执行，不再冻结事件循环
 
 ## 6. 兼容性 Shim 与环境补丁
 
@@ -126,9 +129,13 @@ RuntimeError("not enough GPU video memory")
 |------|------|
 | `generator.py` 模块顶部 | 导入 peft/diffusers 前给 transformers 补 `EncoderDecoderCache` / `DynamicCache` 占位类并 reload——解决 peft≥0.14 对旧版 transformers（如 4.42）的导入兼容 |
 | `backend/_patch_transformers.py` | **独立运维脚本**：把本机 transformers `modeling_utils.py` 中 `safe_open(...).metadata()` 的结果兜底为 `{}`，修复 `metadata.get("format")` 对 None 崩溃。路径硬编码作者机器，其他环境需改路径手动运行 |
-| `main.py` 顶部 | `sys.path.insert(0, r"C:\py_pkgs")` 作者本机额外包目录（部署到他处可删） |
 
-## 7. 已知限制与注意点
+## 7. 单文件模型与"无名 XL"模型的 SDXL 识别
+
+- **SDXL 判定**（`model_manager.detect_sdxl`，`generator._is_sdxl_model` 包装）：名字含 "xl" → 目录读 `model_index.json` 的 `_class_name` 含 "XL" → 单文件 checkpoint 用 `peek_checkpoint_type` 读 safetensors header（`label_emb` / `conditioner.embedders.1` 即 SDXL）。Anima 2.9B、Pony、Illustrious 等**名字不含 "xl" 的 SDXL 架构模型**因此能正确走混合设备布局（原实现按名字猜测，误判为 SD 1.5 整管上 DML 必炸显存）
+- **单文件直载**：`_get_pipeline` 发现本地路径是文件时走 `pipe_cls.from_single_file()`（SD1.5 追加 `safety_checker=None`）；每次冷加载都要在内存中做一次格式转换，常用模型建议 `POST /api/models/convert` 拆包成 Diffusers 目录
+
+## 8. 已知限制与注意点
 
 - DirectML 下 `system.py` 的「GPU 显存」实际显示的是**系统物理内存**（Win32 兜底），仅在 CUDA 下才是真实显存
 - 调度器张量强制搬 DML 的 `_force_scheduler_to_dml` 已被**禁用**（代码注释保留）：Euler 系调度器在 `set_timesteps` 里对 sigmas 调 `numpy()`，DML 张量会崩；改由 `_patch_scheduler_step` 的运行时对齐兜底

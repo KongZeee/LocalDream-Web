@@ -4,7 +4,9 @@ export interface ModelInfo {
   id: string;
   name: string;
   type: 'sd15' | 'sdxl';
-  status: 'ready' | 'downloading' | 'error';
+  /** single_file = single-file checkpoint (directly generatable);
+   *  converting = being converted to Diffusers format in the background. */
+  status: 'ready' | 'downloading' | 'converting' | 'single_file' | 'error';
   size_mb: number;
   preview_url: string;
 }
